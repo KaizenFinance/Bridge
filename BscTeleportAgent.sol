@@ -274,10 +274,6 @@ abstract contract Context {
     function _msgSender() internal view virtual returns (address) {
         return msg.sender;
     }
-
-    function _msgData() internal view virtual returns (bytes calldata) {
-        return msg.data;
-    }
 }
 
 /**
@@ -338,7 +334,7 @@ abstract contract Ownable is Context {
 interface IWrappedToken {
     function initialize(string calldata name, string calldata symbol, uint8 decimals, address owner) external;
     function mintTo(address recipient, uint256 amount) external returns (bool);
-    function burn(address account, uint256 amount) external returns (bool);
+    function burnFrom(address account, uint256 amount) external returns (bool);
 }
 
 contract BscTeleportAgent is Ownable, Initializable {
@@ -351,19 +347,28 @@ contract BscTeleportAgent is Ownable, Initializable {
         address addr;
     }
 
-    mapping(address/*original token address in present chain*/ => bool/*registered*/) public originalTokens_;
-    mapping(address/*wrapped token address*/ => OriginalToken) public wrappedToOriginalTokens_;
-    mapping(bytes32/*other chain start tx hash*/ => bool/*filled*/) public filledTeleports_;
-    mapping(address/*other chain token address*/ => mapping(uint256/*other chain id*/ => address/*wrapped token address*/)) public otherChainTokensToWrappedTokens_;
-    mapping(uint256/*original chain id*/ => mapping(address /*original token address*/ => address/*wrapped token address*/)) public originalToWrappedTokens_;
-    mapping(address/*token address in present chain*/ => mapping(uint256/*to chain id*/ => bool/*registered*/)) public routesFromTokenToChain_;
-    address public wrappedTokenImplementation_;
-    uint256 public registerFee_;
-    uint256 public teleportFee_;
+    mapping(address/*original token address in present chain*/ => bool/*registered*/) public originalTokens;
+    mapping(address/*wrapped token address*/ => OriginalToken) public wrappedToOriginalTokens;
+    mapping(bytes32/*other chain start tx hash*/ => bool/*filled*/) public filledTeleports;
+    mapping(address/*other chain token address*/ => mapping(uint256/*other chain id*/ => address/*wrapped token address*/)) public otherChainTokensToWrappedTokens;
+    mapping(uint256/*original chain id*/ => mapping(address /*original token address*/ => address/*wrapped token address*/)) public originalToWrappedTokens;
+    mapping(address/*token address in present chain*/ => mapping(uint256/*to chain id*/ => bool/*registered*/)) public routesFromTokenToChain;
+    /**
+     * @dev The wrappedTokenImplementation is an address of token implementation
+     * must support interface of IWrappedToken and will be cloned (deployed) inside
+     * MinimalProxy on creation token pair from other blockchain and represent
+     * the original token in the origin blockchain
+     */
+    address public wrappedTokenImplementation;
+    uint256 public registerFee;
+    uint256 public teleportFee;
 
     string private constant ERROR_FEE_MISMATCH = "fee mismatch";
     string private constant ERROR_TELEPORT_PAIR_NOT_CREATED = "teloport pair is not created";
     string private constant ERROR_TELEPORT_TX_FILLED_ALREADY = "teleport tx filled already";
+    string private constant ERROR_ZERO_ADDRESS = "zero address";
+    string private constant ERROR_SEND_FEE = "failed to send fee";
+    string private constant ERROR_REGISTER_IN_ORIGINAL_CHAIN = "no need to register teleport to original chain";
 
     event TeleportPairRegistered(
         address indexed sponsor,
@@ -411,48 +416,53 @@ contract BscTeleportAgent is Ownable, Initializable {
         address payable _ownerAddr,
         address _wrappedTokenImpl) external virtual initializer {
 
-        require(_ownerAddr != address(0), "zero owner address");
+        require(_wrappedTokenImpl != address(0), ERROR_ZERO_ADDRESS);
+        require(_ownerAddr != address(0), ERROR_ZERO_ADDRESS);
         initializeOwnable(_ownerAddr);
 
-        registerFee_ = _registerFee;
-        teleportFee_ = _teleportFee;
-        wrappedTokenImplementation_ = _wrappedTokenImpl;
+        registerFee = _registerFee;
+        teleportFee = _teleportFee;
+        wrappedTokenImplementation = _wrappedTokenImpl;
     }
 
-    function _ensureNotContract(address _addr) private view {
-        require(!_addr.isContract(), "contract not allowed to teleport");
-        require(_addr == tx.origin, "proxy not allowed to teleport");
+    modifier ensureNotContract() {
+        address msg_sender = _msgSender();
+        require(!msg_sender.isContract(), "contract not allowed to teleport");
+        require(msg_sender == tx.origin, "proxy not allowed to teleport");
+        _;
     }
 
     function setRegisterFee(uint256 _registerFee) onlyOwner external {
-        registerFee_ = _registerFee;
+        registerFee = _registerFee;
     }
 
     function setTeleportFee(uint256 _teleportFee) onlyOwner external {
-        teleportFee_ = _teleportFee;
+        teleportFee = _teleportFee;
     }
 
     function registerTeleportPair(address _presentChainTokenAddr, uint256 _toChainId) payable external returns (bool) {
+        require(_presentChainTokenAddr != address(0), ERROR_ZERO_ADDRESS);
         require(_presentChainTokenAddr.isContract(), "given address is not a contract");
-        require(!routesFromTokenToChain_[_presentChainTokenAddr][_toChainId], "already registered");
-        require(msg.value >= registerFee_, ERROR_FEE_MISMATCH);
+        require(!routesFromTokenToChain[_presentChainTokenAddr][_toChainId], "already registered");
+        require(msg.value >= registerFee, ERROR_FEE_MISMATCH);
 
         if (msg.value != 0) {
-            payable(owner()).transfer(msg.value);
+            (bool sent, ) = owner().call{value: msg.value}("");
+            require(sent, ERROR_SEND_FEE);
         }
 
-        OriginalToken memory originalToken = wrappedToOriginalTokens_[_presentChainTokenAddr];
+        OriginalToken memory originalToken = wrappedToOriginalTokens[_presentChainTokenAddr];
 
         if (!originalToken.registered) {
-            if (!originalTokens_[_presentChainTokenAddr]) {
-                originalTokens_[_presentChainTokenAddr] = true;
+            if (!originalTokens[_presentChainTokenAddr]) {
+                originalTokens[_presentChainTokenAddr] = true;
             }
 
             originalToken.chainId = block.chainid;
             originalToken.addr = _presentChainTokenAddr;
         }
 
-        require(originalToken.chainId != _toChainId, "no need to register teleport to original chain");
+        require(originalToken.chainId != _toChainId, ERROR_REGISTER_IN_ORIGINAL_CHAIN);
 
         string memory name = IBEP20(_presentChainTokenAddr).name();
         string memory symbol = IBEP20(_presentChainTokenAddr).symbol();
@@ -461,7 +471,7 @@ contract BscTeleportAgent is Ownable, Initializable {
         require(bytes(name).length > 0, "empty token name");
         require(bytes(symbol).length > 0, "empty token symbol");
 
-        routesFromTokenToChain_[_presentChainTokenAddr][_toChainId] = true;
+        routesFromTokenToChain[_presentChainTokenAddr][_toChainId] = true;
 
         emit TeleportPairRegistered(_msgSender(), originalToken.chainId, originalToken.addr, _presentChainTokenAddr, _toChainId, name, symbol, decimals, msg.value);
 
@@ -478,30 +488,32 @@ contract BscTeleportAgent is Ownable, Initializable {
         string calldata _symbol,
         uint8 _decimals) onlyOwner external returns (address) {
 
-        require(otherChainTokensToWrappedTokens_[_fromChainTokenAddr][_fromChainId] == address(0x0), "pair already created");
-        require(block.chainid != _originalTokenChainId, "no need to register teleport to original chain");
+        require(_fromChainTokenAddr != address(0), ERROR_ZERO_ADDRESS);
+        require(_originalTokenAddr != address(0), ERROR_ZERO_ADDRESS);
+        require(otherChainTokensToWrappedTokens[_fromChainTokenAddr][_fromChainId] == address(0x0), "pair already created");
+        require(block.chainid != _originalTokenChainId, ERROR_REGISTER_IN_ORIGINAL_CHAIN);
 
-        address wrappedTokenAddr = originalToWrappedTokens_[_originalTokenChainId][_originalTokenAddr];
+        address wrappedTokenAddr = originalToWrappedTokens[_originalTokenChainId][_originalTokenAddr];
 
         if (wrappedTokenAddr == address(0x0)) {
 
-            address proxyToken = _deployMinimalProxy(wrappedTokenImplementation_);
+            address proxyToken = _deployMinimalProxy(wrappedTokenImplementation);
             IWrappedToken token = IWrappedToken(proxyToken);
             token.initialize(_name, _symbol, _decimals, address(this));
 
             wrappedTokenAddr = address(token);
 
-            originalToWrappedTokens_[_originalTokenChainId][_originalTokenAddr] = wrappedTokenAddr;
+            originalToWrappedTokens[_originalTokenChainId][_originalTokenAddr] = wrappedTokenAddr;
 
-            OriginalToken storage originalToken = wrappedToOriginalTokens_[wrappedTokenAddr];
-            require(!originalToken.registered, "original token already wrapped"); //###// change err msg
+            OriginalToken storage originalToken = wrappedToOriginalTokens[wrappedTokenAddr];
+            require(!originalToken.registered, "original token already wrapped");
 
             originalToken.registered = true;
             originalToken.chainId = _originalTokenChainId;
             originalToken.addr = _originalTokenAddr;
         }
 
-        otherChainTokensToWrappedTokens_[_fromChainTokenAddr][_fromChainId] = wrappedTokenAddr;
+        otherChainTokensToWrappedTokens[_fromChainTokenAddr][_fromChainId] = wrappedTokenAddr;
 
         emit TeleportPairCreated(
             _fromChainId,
@@ -517,42 +529,43 @@ contract BscTeleportAgent is Ownable, Initializable {
         return wrappedTokenAddr;
     }
 
-    function teleportStart(address _tokenAddr, uint256 _amount, uint256 _toChainId) payable external returns (bool) {
+    function teleportStart(address _tokenAddr, uint256 _amount, uint256 _toChainId) payable external ensureNotContract returns (bool) {
+        require(_tokenAddr != address(0), ERROR_ZERO_ADDRESS);
+
         address msgSender = _msgSender();
 
-        _ensureNotContract(msgSender);
-
-        require(msg.value >= teleportFee_, ERROR_FEE_MISMATCH);
+        require(msg.value >= teleportFee, ERROR_FEE_MISMATCH);
 
         if (msg.value != 0) {
-            payable(owner()).transfer(msg.value);
+            (bool sent, ) = owner().call{value: msg.value}("");
+            require(sent, ERROR_SEND_FEE);
         }
 
         uint256 originalTokenChainId;
         address originalTokenAddr;
 
-        if (originalTokens_[_tokenAddr]) {
-            require(routesFromTokenToChain_[_tokenAddr][_toChainId], ERROR_TELEPORT_PAIR_NOT_CREATED);
+        if (originalTokens[_tokenAddr]) {
+            require(routesFromTokenToChain[_tokenAddr][_toChainId], ERROR_TELEPORT_PAIR_NOT_CREATED);
 
             IBEP20(_tokenAddr).safeTransferFrom(msgSender, address(this), _amount);
 
             originalTokenChainId = block.chainid;
             originalTokenAddr = _tokenAddr;
         } else {
-            OriginalToken storage originalToken = wrappedToOriginalTokens_[_tokenAddr];
+            OriginalToken storage originalToken = wrappedToOriginalTokens[_tokenAddr];
 
             require(originalToken.registered, "token address not wrapped");
 
-            IWrappedToken(_tokenAddr).burn(msgSender, _amount);
-
+            bool burn_status = IWrappedToken(_tokenAddr).burnFrom(msgSender, _amount);
+            require(burn_status, "burn failed");
 
             originalTokenChainId = originalToken.chainId;
             originalTokenAddr = originalToken.addr;
 
             if (_toChainId == originalTokenChainId) {
-                require(originalToWrappedTokens_[_toChainId][originalTokenAddr] == _tokenAddr, ERROR_TELEPORT_PAIR_NOT_CREATED);
+                require(originalToWrappedTokens[_toChainId][originalTokenAddr] == _tokenAddr, ERROR_TELEPORT_PAIR_NOT_CREATED);
             } else {
-                require(routesFromTokenToChain_[_tokenAddr][_toChainId], ERROR_TELEPORT_PAIR_NOT_CREATED);
+                require(routesFromTokenToChain[_tokenAddr][_toChainId], ERROR_TELEPORT_PAIR_NOT_CREATED);
             }
         }
 
@@ -570,16 +583,20 @@ contract BscTeleportAgent is Ownable, Initializable {
         address _toAddress,
         uint256 _amount) onlyOwner external returns (bool) {
 
-        require(!filledTeleports_[_fromChainStartTxHash], ERROR_TELEPORT_TX_FILLED_ALREADY);
-        filledTeleports_[_fromChainStartTxHash] = true;
+        require(_fromChainTokenAddr != address(0), ERROR_ZERO_ADDRESS);
+        require(_originalTokenAddr != address(0), ERROR_ZERO_ADDRESS);
+        require(_toAddress != address(0), ERROR_ZERO_ADDRESS);
+        require(!filledTeleports[_fromChainStartTxHash], ERROR_TELEPORT_TX_FILLED_ALREADY);
+        filledTeleports[_fromChainStartTxHash] = true;
 
-        if (block.chainid == _originalTokenChainId && originalTokens_[_originalTokenAddr]) {
+        if (block.chainid == _originalTokenChainId && originalTokens[_originalTokenAddr]) {
             IBEP20(_originalTokenAddr).safeTransfer(_toAddress, _amount);
         } else {
-            address wrappedTokenAddr = otherChainTokensToWrappedTokens_[_fromChainTokenAddr][_fromChainId];
+            address wrappedTokenAddr = otherChainTokensToWrappedTokens[_fromChainTokenAddr][_fromChainId];
             require(wrappedTokenAddr != address(0x0), ERROR_TELEPORT_PAIR_NOT_CREATED);
 
-            IWrappedToken(wrappedTokenAddr).mintTo(_toAddress, _amount);
+            bool mint_status = IWrappedToken(wrappedTokenAddr).mintTo(_toAddress, _amount);
+            require(mint_status, "mint failed");
         }
 
         emit TeleportFinished(
