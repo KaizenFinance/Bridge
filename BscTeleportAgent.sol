@@ -440,6 +440,11 @@ contract BscTeleportAgent is Ownable, Initializable {
         teleportFee = _teleportFee;
     }
 
+	/**
+     * @dev The registerTeleportPair is called in original blockchain to start the process.
+     * Should be called by user willing to register new teleport pair, allowing original token
+     * to be teleported(swapped 1:1 to identical token issued in other chain and back).
+     */
     function registerTeleportPair(address _presentChainTokenAddr, uint256 _toChainId) payable external returns (bool) {
         require(_presentChainTokenAddr != address(0), ERROR_ZERO_ADDRESS);
         require(_presentChainTokenAddr.isContract(), "given address is not a contract");
@@ -478,6 +483,12 @@ contract BscTeleportAgent is Ownable, Initializable {
         return true;
     }
 
+	/**
+     * @dev The createTeleportPair is called by oracle in the target blockchain where
+     * original tokens should be teleported. This function creates a corresponding token
+     * in target blockchain and shows the reliance between original token in origin chain
+	 * and corresponding token in target blockchain.
+     */
     function createTeleportPair(
         uint256 _fromChainId,
         address _fromChainTokenAddr,
@@ -529,6 +540,11 @@ contract BscTeleportAgent is Ownable, Initializable {
         return wrappedTokenAddr;
     }
 
+	/**
+     * @dev The teleportStart is called by user in original blockchain each time user wants
+     * to switch original token in origin blockchain to corresponding token in target chain.
+     * It freezes original tokens on the bridge and emit a signal to the oracle.
+     */
     function teleportStart(address _tokenAddr, uint256 _amount, uint256 _toChainId) payable external ensureNotContract returns (bool) {
         require(_tokenAddr != address(0), ERROR_ZERO_ADDRESS);
 
@@ -574,6 +590,11 @@ contract BscTeleportAgent is Ownable, Initializable {
         return true;
     }
 
+	/**
+     * @dev The teleportFinish is called by oracle in target blockchain after user's call of the
+     * teleportStart function in origin blockchain. It mints necessary amount of corresponding
+     * tokens in the target blockchain to the user's wallet.
+     */
     function teleportFinish(
         uint256 _fromChainId,
         address _fromChainTokenAddr,
